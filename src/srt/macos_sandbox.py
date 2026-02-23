@@ -41,6 +41,7 @@ SandboxViolationCallback = type(lambda v: None)  # just a hint placeholder
 @dataclass
 class FsReadRestrictionConfig:
     deny_only: list[str]
+    allow_only: list[str] | None = None
 
 
 @dataclass
@@ -186,6 +187,63 @@ def _generate_read_rules(config: FsReadRestrictionConfig | None, log_tag: str) -
     if config is None:
         return ["(allow file-read*)"]
 
+    # Allowlist mode: deny all reads, then allow only listed paths
+    if config.allow_only:
+        rules: list[str] = []
+        for pattern in config.allow_only:
+            normalized = normalize_path_for_sandbox(pattern)
+            if contains_glob_chars(normalized):
+                regex_pat = glob_to_regex(normalized)
+                rules.extend(
+                    [
+                        "(allow file-read*",
+                        f"  (regex {_escape_path(regex_pat)}))",
+                    ]
+                )
+            else:
+                rules.extend(
+                    [
+                        "(allow file-read*",
+                        f"  (subpath {_escape_path(normalized)}))",
+                    ]
+                )
+                # Allow reading ancestor directories for path traversal
+                for ancestor in _get_ancestor_directories(normalized):
+                    rules.extend(
+                        [
+                            "(allow file-read*",
+                            f"  (literal {_escape_path(ancestor)}))",
+                        ]
+                    )
+
+        # Root directory itself must be listable for path resolution
+        rules.append('(allow file-read* (literal "/"))')
+
+        # Deny overrides (takes precedence — placed after allows)
+        for pattern in config.deny_only or []:
+            normalized = normalize_path_for_sandbox(pattern)
+            if contains_glob_chars(normalized):
+                regex_pat = glob_to_regex(normalized)
+                rules.extend(
+                    [
+                        "(deny file-read*",
+                        f"  (regex {_escape_path(regex_pat)})",
+                        f'  (with message "{log_tag}"))',
+                    ]
+                )
+            else:
+                rules.extend(
+                    [
+                        "(deny file-read*",
+                        f"  (subpath {_escape_path(normalized)})",
+                        f'  (with message "{log_tag}"))',
+                    ]
+                )
+
+        rules.extend(_generate_move_blocking_rules(config.deny_only or [], log_tag))
+        return rules
+
+    # Legacy denylist mode: allow all reads, then deny specific paths
     rules = ["(allow file-read*)"]
 
     for pattern in config.deny_only or []:
@@ -534,7 +592,10 @@ def wrap_command_with_sandbox_macos(params: MacOSSandboxParams) -> str:
 
     Returns the fully-escaped command ready for ``subprocess.Popen(shell=True)``.
     """
-    has_read_restrictions = params.read_config is not None and len(params.read_config.deny_only) > 0
+    has_read_restrictions = params.read_config is not None and (
+        len(params.read_config.deny_only) > 0
+        or (params.read_config.allow_only is not None and len(params.read_config.allow_only) > 0)
+    )
     has_write_restrictions = params.write_config is not None
 
     if (

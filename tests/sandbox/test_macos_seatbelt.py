@@ -153,6 +153,127 @@ class TestSeatbeltReadBypassPrevention:
         assert "GLOB_SECRET_2" in result.stdout
 
 
+_ESSENTIAL_SYSTEM_PATHS = [
+    "/bin", "/usr", "/sbin", "/dev", "/etc", "/private/tmp",
+    "/private/var", "/private/etc", "/var",
+    "/Library", "/System", "/opt",
+]
+
+
+@skip_if_not_macos
+class TestSeatbeltReadAllowlist:
+    """Test read allowlist enforcement (allow_only restricts readable paths)."""
+
+    @pytest.fixture(autouse=True)
+    def setup_dirs(self):
+        self.test_base = _make_test_base()
+        self.allowed_dir = os.path.join(self.test_base, "allowed")
+        self.blocked_dir = os.path.join(self.test_base, "blocked")
+        os.makedirs(self.allowed_dir, exist_ok=True)
+        os.makedirs(self.blocked_dir, exist_ok=True)
+
+        self.allowed_file = os.path.join(self.allowed_dir, "visible.txt")
+        self.blocked_file = os.path.join(self.blocked_dir, "secret.txt")
+        with open(self.allowed_file, "w") as f:
+            f.write("VISIBLE_CONTENT")
+        with open(self.blocked_file, "w") as f:
+            f.write("SECRET_CONTENT")
+
+        # Paths the shell needs to function, plus our test directories
+        self.system_allow = list(_ESSENTIAL_SYSTEM_PATHS) + [self.allowed_dir]
+        yield
+        if os.path.exists(self.test_base):
+            shutil.rmtree(self.test_base, ignore_errors=True)
+
+    def _run(self, cmd: str, timeout: int = 5) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+
+    def test_allow_read_within_allowed_path(self):
+        read_config = FsReadRestrictionConfig(
+            deny_only=[], allow_only=self.system_allow,
+        )
+        wrapped = wrap_command_with_sandbox_macos(
+            MacOSSandboxParams(
+                command=f"cat {self.allowed_file}",
+                needs_network_restriction=False,
+                read_config=read_config,
+            )
+        )
+        result = self._run(wrapped)
+        assert result.returncode == 0
+        assert "VISIBLE_CONTENT" in result.stdout
+
+    def test_block_read_outside_allowed_path(self):
+        # Use a tight allowlist: system essentials + allowed_dir only (NOT /private/tmp)
+        # so the blocked_dir (sibling under test_base) is NOT reachable.
+        tight_allow = [
+            p for p in _ESSENTIAL_SYSTEM_PATHS
+            if p not in ("/private/tmp",)
+        ] + [self.allowed_dir]
+        read_config = FsReadRestrictionConfig(
+            deny_only=[], allow_only=tight_allow,
+        )
+        wrapped = wrap_command_with_sandbox_macos(
+            MacOSSandboxParams(
+                command=f"cat {self.blocked_file}",
+                needs_network_restriction=False,
+                read_config=read_config,
+            )
+        )
+        result = self._run(wrapped)
+        assert result.returncode != 0
+        assert "SECRET_CONTENT" not in result.stdout
+
+    def test_block_ls_users_with_allowlist(self):
+        read_config = FsReadRestrictionConfig(
+            deny_only=[], allow_only=self.system_allow,
+        )
+        wrapped = wrap_command_with_sandbox_macos(
+            MacOSSandboxParams(
+                command="ls /Users",
+                needs_network_restriction=False,
+                read_config=read_config,
+            )
+        )
+        result = self._run(wrapped)
+        assert result.returncode != 0
+
+    def test_deny_overrides_allow(self):
+        denied_file = os.path.join(self.allowed_dir, "denied.txt")
+        with open(denied_file, "w") as f:
+            f.write("DENIED_WITHIN_ALLOW")
+
+        read_config = FsReadRestrictionConfig(
+            deny_only=[denied_file], allow_only=self.system_allow,
+        )
+        wrapped = wrap_command_with_sandbox_macos(
+            MacOSSandboxParams(
+                command=f"cat {denied_file}",
+                needs_network_restriction=False,
+                read_config=read_config,
+            )
+        )
+        result = self._run(wrapped)
+        assert result.returncode != 0
+        assert "DENIED_WITHIN_ALLOW" not in result.stdout
+
+    def test_legacy_denylist_still_works(self):
+        """When allow_only is None, fall back to allow-all + deny_only."""
+        read_config = FsReadRestrictionConfig(
+            deny_only=[self.blocked_dir], allow_only=None
+        )
+        wrapped = wrap_command_with_sandbox_macos(
+            MacOSSandboxParams(
+                command=f"cat {self.allowed_file}",
+                needs_network_restriction=False,
+                read_config=read_config,
+            )
+        )
+        result = self._run(wrapped)
+        assert result.returncode == 0
+        assert "VISIBLE_CONTENT" in result.stdout
+
+
 @skip_if_not_macos
 class TestSeatbeltWriteRestrictions:
     """Test write allow/deny enforcement."""

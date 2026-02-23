@@ -104,9 +104,17 @@ class NetworkConfig(BaseModel):
 
 
 class FilesystemConfig(BaseModel):
+    allow_read: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Paths allowed for reading (allowlist). When non-empty, only these paths "
+            "(and essential OS paths) are readable; everything else is denied. "
+            "When empty, all reads are allowed (subject to deny_read)."
+        ),
+    )
     deny_read: list[str] = Field(
         default_factory=list,
-        description="Paths denied for reading",
+        description="Paths denied for reading (takes precedence over allow_read)",
     )
     allow_write: list[str] = Field(
         default_factory=list,
@@ -121,12 +129,83 @@ class FilesystemConfig(BaseModel):
         description="Allow writes to .git/config files (default: false).",
     )
 
-    @field_validator("deny_read", "allow_write", "deny_write", mode="before")
+    @field_validator("allow_read", "deny_read", "allow_write", "deny_write", mode="before")
     @classmethod
     def validate_paths_nonempty(cls, v: list[str]) -> list[str]:
         for p in v:
             if not p:
                 raise ValueError("Filesystem paths must not be empty strings")
+        return v
+
+
+_DEFAULT_ENV_DENY_PATTERNS: list[str] = [
+    r"(?i).*api[_-]?key.*",
+    r"(?i).*secret.*",
+    r"(?i).*token.*",
+    r"(?i).*password.*",
+    r"(?i).*credential.*",
+    r"(?i).*private[_-]?key.*",
+    r"(?i).*auth.*",
+    r"(?i)^AWS_.*",
+    r"(?i)^GITHUB_TOKEN$",
+    r"(?i)^GH_TOKEN$",
+    r"(?i)^OPENAI_.*",
+    r"(?i)^ANTHROPIC_.*",
+    r"(?i)^GOOGLE_.*KEY.*",
+    r"(?i)^AZURE_.*",
+    r"(?i)^DATABASE_URL$",
+    r"(?i)^REDIS_URL$",
+    r"(?i)^MONGO.*URI$",
+    r"(?i)^SMTP_.*",
+    r"(?i)^SENDGRID_.*",
+    r"(?i)^STRIPE_.*",
+    r"(?i)^TWILIO_.*",
+]
+
+_DEFAULT_ENV_ALLOW: list[str] = [
+    "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
+    "TERM", "TMPDIR", "TMP", "TEMP", "EDITOR", "VISUAL",
+    "PWD", "OLDPWD", "SHLVL", "LOGNAME", "HOSTNAME",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
+    "NODE_NO_WARNINGS", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED",
+    "SANDBOX_RUNTIME",
+]
+
+
+class EnvironmentConfig(BaseModel):
+    """Controls which environment variables are passed into sandboxed processes."""
+
+    mode: str = Field(
+        default="deny_secrets",
+        description=(
+            "Filtering mode: 'passthrough' (no filtering), "
+            "'deny_secrets' (block vars matching deny_patterns), "
+            "'allowlist' (only pass vars in allow list)."
+        ),
+    )
+    deny_patterns: list[str] = Field(
+        default_factory=lambda: list(_DEFAULT_ENV_DENY_PATTERNS),
+        description="Regex patterns for env var names to strip (used in deny_secrets mode).",
+    )
+    allow: list[str] = Field(
+        default_factory=lambda: list(_DEFAULT_ENV_ALLOW),
+        description="Env var names to always pass through (used in allowlist mode, also exempts from deny).",
+    )
+    extra_allow: list[str] = Field(
+        default_factory=list,
+        description="Additional env var names to pass through.",
+    )
+    inject: dict[str, str] = Field(
+        default_factory=dict,
+        description="Env vars to forcibly set (overrides).",
+    )
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, v: str) -> str:
+        allowed = {"passthrough", "deny_secrets", "allowlist"}
+        if v not in allowed:
+            raise ValueError(f"mode must be one of {allowed}, got '{v}'")
         return v
 
 
@@ -151,6 +230,18 @@ class SandboxRuntimeConfig(BaseModel):
     filesystem: FilesystemConfig = Field(
         default_factory=FilesystemConfig,
         description="Filesystem restrictions configuration",
+    )
+    environment: EnvironmentConfig = Field(
+        default_factory=EnvironmentConfig,
+        description="Environment variable filtering for sandboxed processes.",
+    )
+    workspace_root: str | None = Field(
+        default=None,
+        description=(
+            "Workspace root path. When set, enables workspace-root mode: "
+            "allow_read and allow_write are auto-populated relative to this "
+            "directory (plus OS essentials), giving chroot-like isolation."
+        ),
     )
     ignore_violations: dict[str, list[str]] | None = Field(
         default=None,

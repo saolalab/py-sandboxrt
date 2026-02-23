@@ -37,6 +37,7 @@ DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3
 @dataclass
 class FsReadRestrictionConfig:
     deny_only: list[str] = field(default_factory=list)
+    allow_only: list[str] | None = None
 
 
 @dataclass
@@ -300,9 +301,60 @@ def _generate_filesystem_args(
 ) -> list[str]:
     args: list[str] = []
 
-    if write_config is not None:
-        args.extend(["--ro-bind", "/", "/"])
+    use_read_allowlist = (
+        read_config is not None
+        and read_config.allow_only is not None
+        and len(read_config.allow_only) > 0
+    )
+
+    if use_read_allowlist:
+        # Read allowlist mode: mount only allowed paths as read-only
+        # Start with an empty tmpfs root
+        args.extend(["--tmpfs", "/"])
+
+        already_mounted: set[str] = set()
+
+        for pattern in read_config.allow_only:  # type: ignore[union-attr]
+            normalized = normalize_path_for_sandbox(pattern)
+            if normalized.startswith("/dev/") or normalized == "/dev":
+                continue
+            if not os.path.exists(normalized):
+                log_debug(f"[Sandbox Linux] Skipping non-existent allow_read path: {normalized}")
+                continue
+            args.extend(["--ro-bind", normalized, normalized])
+            already_mounted.add(normalized)
+            # Ensure ancestor directories exist in the namespace
+            for ancestor in _get_ancestor_directories_list(normalized):
+                if ancestor not in already_mounted and ancestor != "/":
+                    if os.path.exists(ancestor):
+                        args.extend(["--ro-bind", ancestor, ancestor])
+                        already_mounted.add(ancestor)
+
+        # Write paths are bind-mounted as read-write (overrides ro-bind)
         allowed_write_paths: list[str] = []
+        if write_config is not None:
+            for pattern in write_config.allow_only or []:
+                normalized = normalize_path_for_sandbox(pattern)
+                if normalized.startswith("/dev/"):
+                    continue
+                if not os.path.exists(normalized):
+                    continue
+                try:
+                    resolved = os.path.realpath(normalized)
+                    norm_compare = normalized.rstrip("/")
+                    if resolved != norm_compare and is_symlink_outside_boundary(
+                        normalized, resolved
+                    ):
+                        continue
+                except OSError:
+                    continue
+                args.extend(["--bind", normalized, normalized])
+                allowed_write_paths.append(normalized)
+
+    elif write_config is not None:
+        # Legacy: full root as read-only, selective write paths
+        args.extend(["--ro-bind", "/", "/"])
+        allowed_write_paths = []
 
         for pattern in write_config.allow_only or []:
             normalized = normalize_path_for_sandbox(pattern)
@@ -327,7 +379,12 @@ def _generate_filesystem_args(
 
             args.extend(["--bind", normalized, normalized])
             allowed_write_paths.append(normalized)
+    else:
+        args.extend(["--bind", "/", "/"])
+        allowed_write_paths = []
 
+    # Write deny paths (mandatory protections)
+    if write_config is not None:
         deny_paths = list(write_config.deny_within_allow or []) + _linux_get_mandatory_deny_paths(
             mandatory_deny_search_depth,
             allow_git_config,
@@ -372,10 +429,8 @@ def _generate_filesystem_args(
             )
             if within_allowed:
                 args.extend(["--ro-bind", normalized, normalized])
-    else:
-        args.extend(["--bind", "/", "/"])
 
-    # Read deny paths
+    # Read deny paths (denylist always applied on top of allow or full-access)
     deny_read = list((read_config.deny_only if read_config else []) or [])
     if os.path.exists("/etc/ssh/ssh_config.d"):
         deny_read.append("/etc/ssh/ssh_config.d")
@@ -390,6 +445,19 @@ def _generate_filesystem_args(
             args.extend(["--ro-bind", "/dev/null", normalized])
 
     return args
+
+
+def _get_ancestor_directories_list(path_str: str) -> list[str]:
+    """Get all ancestor directories of a path (excluding root)."""
+    ancestors: list[str] = []
+    current = os.path.dirname(path_str)
+    while current not in ("/", "."):
+        ancestors.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return ancestors
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +554,10 @@ def wrap_command_with_sandbox_linux(params: LinuxSandboxParams) -> str:
 
     Returns the fully-escaped command ready for ``subprocess.Popen(shell=True)``.
     """
-    has_read = params.read_config is not None and len(params.read_config.deny_only) > 0
+    has_read = params.read_config is not None and (
+        len(params.read_config.deny_only) > 0
+        or (params.read_config.allow_only is not None and len(params.read_config.allow_only) > 0)
+    )
     has_write = params.write_config is not None
 
     if not params.needs_network_restriction and not has_read and not has_write:

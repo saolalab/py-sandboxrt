@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import subprocess
+import sys
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 
-from srt.config import SandboxRuntimeConfig
+from srt.config import EnvironmentConfig, SandboxRuntimeConfig
 from srt.debug import log_debug
 from srt.http_proxy import HttpProxyServer
 from srt.linux_sandbox import (
@@ -52,6 +55,39 @@ from srt.socks_proxy import SocksProxyServer
 from srt.violation_store import SandboxViolationStore
 
 NetworkAskCallback = Callable[[str, int], Awaitable[bool]]
+
+_MACOS_ESSENTIAL_PATHS = [
+    "/tmp", "/private/tmp", "/usr", "/bin", "/sbin", "/etc", "/dev",
+    "/opt", "/Library", "/System", "/private/var", "/private/etc", "/var",
+]
+_LINUX_ESSENTIAL_PATHS = [
+    "/tmp", "/usr", "/bin", "/sbin", "/etc", "/dev",
+    "/lib", "/lib64", "/opt", "/var", "/proc", "/sys",
+]
+
+
+def _essential_read_paths() -> list[str]:
+    if sys.platform == "darwin":
+        return list(_MACOS_ESSENTIAL_PATHS)
+    return list(_LINUX_ESSENTIAL_PATHS)
+
+
+@dataclass
+class CommandOverrides:
+    """Per-command overrides applied on top of the base sandbox config.
+
+    Useful for giving MCP servers different permissions than exec commands.
+    Fields that are ``None`` inherit the base config value.
+    """
+
+    extra_allow_read: list[str] | None = None
+    extra_allow_write: list[str] | None = None
+    extra_deny_read: list[str] | None = None
+    extra_deny_write: list[str] | None = None
+    extra_allowed_domains: list[str] | None = None
+    env_mode: str | None = None
+    env_extra_allow: list[str] = field(default_factory=list)
+    env_inject: dict[str, str] = field(default_factory=dict)
 
 
 class SandboxManager:
@@ -122,6 +158,7 @@ class SandboxManager:
             return
 
         self._config = runtime_config
+        self._apply_workspace_root()
 
         deps = self.check_dependencies()
         if deps.errors:
@@ -198,7 +235,18 @@ class SandboxManager:
                 deny.extend(expand_glob_pattern(p))
             else:
                 deny.append(stripped)
-        return MacFsRead(deny_only=deny)
+
+        allow: list[str] | None = None
+        if self._config.filesystem.allow_read:
+            allow = []
+            for p in self._config.filesystem.allow_read:
+                stripped = remove_trailing_glob_suffix(p)
+                if get_platform() == "linux" and contains_glob_chars(stripped):
+                    allow.extend(expand_glob_pattern(p))
+                else:
+                    allow.append(stripped)
+
+        return MacFsRead(deny_only=deny, allow_only=allow)
 
     def get_fs_write_config(self) -> MacFsWrite:
         if not self._config:
@@ -234,20 +282,114 @@ class SandboxManager:
         log_debug("Sandbox configuration updated")
 
     # ------------------------------------------------------------------
+    # Environment filtering
+    # ------------------------------------------------------------------
+
+    def get_filtered_env(
+        self,
+        base_env: dict[str, str] | None = None,
+        *,
+        overrides: CommandOverrides | None = None,
+    ) -> dict[str, str]:
+        """Return a filtered copy of *base_env* (defaults to ``os.environ``).
+
+        The filtering behaviour depends on ``EnvironmentConfig.mode``:
+
+        * ``passthrough`` — no filtering, returns env as-is (+ injects).
+        * ``deny_secrets`` — strips vars whose name matches any deny pattern,
+          unless the name appears in the allow/extra_allow lists.
+        * ``allowlist`` — keeps *only* vars in allow + extra_allow.
+        """
+        src = dict(base_env) if base_env is not None else dict(os.environ)
+        cfg: EnvironmentConfig = self._config.environment if self._config else EnvironmentConfig()
+
+        mode = overrides.env_mode if overrides and overrides.env_mode else cfg.mode
+        extra_allow = set(cfg.extra_allow) | (set(overrides.env_extra_allow) if overrides else set())
+        always_allow = set(cfg.allow) | extra_allow
+        inject = dict(cfg.inject)
+        if overrides and overrides.env_inject:
+            inject.update(overrides.env_inject)
+
+        if mode == "passthrough":
+            filtered = dict(src)
+        elif mode == "allowlist":
+            filtered = {k: v for k, v in src.items() if k in always_allow}
+        else:
+            compiled = [re.compile(p) for p in cfg.deny_patterns]
+            filtered = {}
+            for k, v in src.items():
+                if k in always_allow:
+                    filtered[k] = v
+                    continue
+                if any(pat.fullmatch(k) for pat in compiled):
+                    log_debug(f"env filter: stripped {k}")
+                    continue
+                filtered[k] = v
+
+        filtered.update(inject)
+        return filtered
+
+    # ------------------------------------------------------------------
     # Wrap command
     # ------------------------------------------------------------------
 
-    async def wrap_with_sandbox(self, command: str, *, bin_shell: str | None = None) -> str:
+    def _apply_workspace_root(self) -> None:
+        """Auto-populate filesystem allow_read / allow_write from workspace_root."""
+        if not self._config or not self._config.workspace_root:
+            return
+        ws = self._config.workspace_root
+        fs = self._config.filesystem
+        if not fs.allow_read:
+            fs.allow_read = [ws] + _essential_read_paths()
+        if not fs.allow_write:
+            fs.allow_write = [ws, "/tmp"]
+
+    async def wrap_with_sandbox(
+        self,
+        command: str,
+        *,
+        bin_shell: str | None = None,
+        overrides: CommandOverrides | None = None,
+    ) -> str:
         """
         Wrap *command* with platform-appropriate sandbox restrictions.
+
+        When *overrides* is provided, extra paths/domains are merged on top of
+        the base config for this single invocation only (the base config is
+        not mutated).
 
         Returns a shell string that can be passed to ``subprocess.Popen(shell=True)``.
         """
         platform = get_platform()
 
+        self._apply_workspace_root()
+
         cfg = self._config
         read_config = self.get_fs_read_config()
         write_config = self.get_fs_write_config()
+
+        if overrides:
+            if overrides.extra_allow_read:
+                allow = list(read_config.allow_only or []) + overrides.extra_allow_read
+                read_config = type(read_config)(
+                    deny_only=read_config.deny_only,
+                    allow_only=allow,
+                )
+            if overrides.extra_deny_read:
+                read_config = type(read_config)(
+                    deny_only=read_config.deny_only + overrides.extra_deny_read,
+                    allow_only=read_config.allow_only,
+                )
+            if overrides.extra_allow_write:
+                write_config = type(write_config)(
+                    allow_only=write_config.allow_only + overrides.extra_allow_write,
+                    deny_within_allow=write_config.deny_within_allow,
+                )
+            if overrides.extra_deny_write:
+                write_config = type(write_config)(
+                    allow_only=write_config.allow_only,
+                    deny_within_allow=write_config.deny_within_allow + overrides.extra_deny_write,
+                )
 
         has_network = cfg is not None and cfg.network.allowed_domains is not None
         needs_network_restriction = has_network
@@ -276,7 +418,10 @@ class SandboxManager:
             )
 
         if platform == "linux":
-            linux_read = LinuxFsRead(deny_only=read_config.deny_only)
+            linux_read = LinuxFsRead(
+                deny_only=read_config.deny_only,
+                allow_only=read_config.allow_only,
+            )
             linux_write = LinuxFsWrite(
                 allow_only=write_config.allow_only,
                 deny_within_allow=write_config.deny_within_allow,

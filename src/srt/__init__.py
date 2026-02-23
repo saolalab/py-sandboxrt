@@ -5,21 +5,24 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions
 on arbitrary processes at the OS level, without requiring a container.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from srt.config import (
+    EnvironmentConfig,
     FilesystemConfig,
     NetworkConfig,
     SandboxRuntimeConfig,
 )
-from srt.sandbox_manager import SandboxManager
+from srt.sandbox_manager import CommandOverrides, SandboxManager
 from srt.violation_store import SandboxViolationStore
 
 __all__ = [
     "__version__",
-    "SandboxManager",
-    "SandboxViolationStore",
-    "SandboxRuntimeConfig",
-    "NetworkConfig",
+    "CommandOverrides",
+    "EnvironmentConfig",
     "FilesystemConfig",
+    "NetworkConfig",
+    "SandboxManager",
+    "SandboxRuntimeConfig",
+    "SandboxViolationStore",
 ]

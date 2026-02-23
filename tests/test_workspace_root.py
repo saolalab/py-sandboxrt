@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-
-import pytest
-
 from srt.config import FilesystemConfig, SandboxRuntimeConfig
 from srt.sandbox_manager import CommandOverrides, SandboxManager, _essential_read_paths
 

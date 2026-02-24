@@ -57,12 +57,33 @@ from srt.violation_store import SandboxViolationStore
 NetworkAskCallback = Callable[[str, int], Awaitable[bool]]
 
 _MACOS_ESSENTIAL_PATHS = [
-    "/tmp", "/private/tmp", "/usr", "/bin", "/sbin", "/etc", "/dev",
-    "/opt", "/Library", "/System", "/private/var", "/private/etc", "/var",
+    "/tmp",
+    "/private/tmp",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/etc",
+    "/dev",
+    "/opt",
+    "/Library",
+    "/System",
+    "/private/var",
+    "/private/etc",
+    "/var",
 ]
 _LINUX_ESSENTIAL_PATHS = [
-    "/tmp", "/usr", "/bin", "/sbin", "/etc", "/dev",
-    "/lib", "/lib64", "/opt", "/var", "/proc", "/sys",
+    "/tmp",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/etc",
+    "/dev",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/var",
+    "/proc",
+    "/sys",
 ]
 
 
@@ -304,7 +325,9 @@ class SandboxManager:
         cfg: EnvironmentConfig = self._config.environment if self._config else EnvironmentConfig()
 
         mode = overrides.env_mode if overrides and overrides.env_mode else cfg.mode
-        extra_allow = set(cfg.extra_allow) | (set(overrides.env_extra_allow) if overrides else set())
+        extra_allow = set(cfg.extra_allow) | (
+            set(overrides.env_extra_allow) if overrides else set()
+        )
         always_allow = set(cfg.allow) | extra_allow
         inject = dict(cfg.inject)
         if overrides and overrides.env_inject:

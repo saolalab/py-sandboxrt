@@ -154,9 +154,18 @@ class TestSeatbeltReadBypassPrevention:
 
 
 _ESSENTIAL_SYSTEM_PATHS = [
-    "/bin", "/usr", "/sbin", "/dev", "/etc", "/private/tmp",
-    "/private/var", "/private/etc", "/var",
-    "/Library", "/System", "/opt",
+    "/bin",
+    "/usr",
+    "/sbin",
+    "/dev",
+    "/etc",
+    "/private/tmp",
+    "/private/var",
+    "/private/etc",
+    "/var",
+    "/Library",
+    "/System",
+    "/opt",
 ]
 
 
@@ -190,7 +199,8 @@ class TestSeatbeltReadAllowlist:
 
     def test_allow_read_within_allowed_path(self):
         read_config = FsReadRestrictionConfig(
-            deny_only=[], allow_only=self.system_allow,
+            deny_only=[],
+            allow_only=self.system_allow,
         )
         wrapped = wrap_command_with_sandbox_macos(
             MacOSSandboxParams(
@@ -206,12 +216,12 @@ class TestSeatbeltReadAllowlist:
     def test_block_read_outside_allowed_path(self):
         # Use a tight allowlist: system essentials + allowed_dir only (NOT /private/tmp)
         # so the blocked_dir (sibling under test_base) is NOT reachable.
-        tight_allow = [
-            p for p in _ESSENTIAL_SYSTEM_PATHS
-            if p not in ("/private/tmp",)
-        ] + [self.allowed_dir]
+        tight_allow = [p for p in _ESSENTIAL_SYSTEM_PATHS if p not in ("/private/tmp",)] + [
+            self.allowed_dir
+        ]
         read_config = FsReadRestrictionConfig(
-            deny_only=[], allow_only=tight_allow,
+            deny_only=[],
+            allow_only=tight_allow,
         )
         wrapped = wrap_command_with_sandbox_macos(
             MacOSSandboxParams(
@@ -226,7 +236,8 @@ class TestSeatbeltReadAllowlist:
 
     def test_block_ls_users_with_allowlist(self):
         read_config = FsReadRestrictionConfig(
-            deny_only=[], allow_only=self.system_allow,
+            deny_only=[],
+            allow_only=self.system_allow,
         )
         wrapped = wrap_command_with_sandbox_macos(
             MacOSSandboxParams(
@@ -244,7 +255,8 @@ class TestSeatbeltReadAllowlist:
             f.write("DENIED_WITHIN_ALLOW")
 
         read_config = FsReadRestrictionConfig(
-            deny_only=[denied_file], allow_only=self.system_allow,
+            deny_only=[denied_file],
+            allow_only=self.system_allow,
         )
         wrapped = wrap_command_with_sandbox_macos(
             MacOSSandboxParams(
@@ -259,9 +271,7 @@ class TestSeatbeltReadAllowlist:
 
     def test_legacy_denylist_still_works(self):
         """When allow_only is None, fall back to allow-all + deny_only."""
-        read_config = FsReadRestrictionConfig(
-            deny_only=[self.blocked_dir], allow_only=None
-        )
+        read_config = FsReadRestrictionConfig(deny_only=[self.blocked_dir], allow_only=None)
         wrapped = wrap_command_with_sandbox_macos(
             MacOSSandboxParams(
                 command=f"cat {self.allowed_file}",
